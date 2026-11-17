@@ -1,0 +1,96 @@
+# Build environment for the mun-uniffi KMP library.
+#
+# The entry point is the justfile (`just` runs everything from setup to the KMP
+# build); its recipes run their commands inside these environments with
+# `pixi run`. The tasks below are shortcuts that call justfile recipes:
+#
+#   pixi run build             # mun -> uniffi -> kmp (the full pipeline)
+#   pixi run mun | uniffi | kmp   # one stage, plus the stages before it
+#   pixi run test              # KMP JVM + Android host tests
+#
+# Rust comes from rustup, pinned by rust-toolchain.toml (conda-forge has no
+# rust-std for most of the cross targets).
+#
+# LLVM 14 (linked by the Mun compiler):
+# - default env, every platform: conda-forge llvmdev/lld 14 build this host's
+#   own library with plain cargo, and the bindings.
+# - cross env, linux-64 only: llvmdev has no Android, musl, armv7, i686,
+#   riscv64, FreeBSD or Windows x86/arm64 builds, so scripts/ (run_workflow.py) builds
+#   LLVM 14 for those targets from source (using the default env's
+#   llvm-tblgen) and cross-compiles with the NDK, zig, or clang-cl + xwin.
+#   No containers are involved.
+[workspace]
+name = "mun-uniffi"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
+
+[dependencies]
+just = ">=1.40"
+openjdk = "21.*"
+llvmdev = "14.0.6.*"
+lld = "14.0.6.*"
+libffi = ">=3.4"
+zlib = ">=1.2.13"
+
+[target.unix.activation.env]
+LLVM_SYS_140_PREFIX = "$CONDA_PREFIX"
+
+[target.win-64.activation.env]
+LLVM_SYS_140_PREFIX = "%CONDA_PREFIX%\\Library"
+
+[target.osx-64.dependencies]
+macosx_deployment_target_osx-64 = "15.5.*"
+compiler-rt = "14.*"
+
+[target.osx-arm64.dependencies]
+macosx_deployment_target_osx-arm64 = "15.5.*"
+compiler-rt = "14.*"
+
+[target.osx.activation.env]
+DYLD_FALLBACK_LIBRARY_PATH = "$CONDA_PREFIX/lib"
+LIBRARY_PATH = "$CONDA_PREFIX/lib/clang/14.0.6/lib/darwin"
+
+[tasks]
+llvm14-check = "llvm-config --version"
+
+# Build workflow: mun -> uniffi -> kmp
+mun = { cmd = "just build-host", description = "Build the Mun-embedding Rust library for this host" }
+uniffi = { cmd = "just clean-kmp generate-bindings", depends-on = ["mun"], description = "Regenerate the Kotlin bindings with gobley-uniffi-bindgen" }
+kmp = { cmd = "just copy-host build-kmp", depends-on = ["uniffi"], description = "Copy the libraries into libkmp and assemble the KMP library" }
+build = { depends-on = ["kmp"], description = "Full pipeline: mun -> uniffi -> kmp" }
+test = { cmd = "just test-kmp", description = "Run the KMP JVM and Android host tests" }
+
+# Linux x86_64 cross-compiles every target instead (scripts/run_workflow.py)
+[target.linux-64.tasks]
+mun = { cmd = "just build-android build-linux build-windows", description = "Cross-build the Mun-embedding Rust library for Android, Linux, FreeBSD and Windows" }
+kmp = { cmd = "just copy-android copy-linux copy-windows build-kmp", depends-on = ["uniffi"], description = "Copy the libraries into libkmp and assemble the KMP library" }
+
+# Cross-compilation toolchain: Linux x86_64 hosts only (the cross scripts refuse
+# other hosts, and zig 0.16 + clang 22 do not solve together on macOS).
+[feature.cross]
+platforms = ["linux-64"]
+
+[feature.cross.dependencies]
+just = ">=1.40"
+openjdk = "21.*"
+zig = "0.16.0.*"
+cargo-zigbuild = "0.24.*"
+clang = "22.*"
+clangxx = "22.*"
+lld = "22.*"
+llvm-tools = "22.*"
+cmake = ">=3.22"
+ninja = ">=1.11"
+curl = "*"
+unzip = "*"
+xz = "*"
+
+[feature.cross.activation.env]
+LLVM14_HOST = "$PIXI_PROJECT_ROOT/.pixi/envs/default"
+
+[feature.cross.tasks]
+# One-time downloads: LLVM source, Android NDK + SDK, cargo-xwin
+setup = { cmd = "just setup-cross", depends-on = [{ task = "llvm14-check", environment = "default" }] }
+
+[environments]
+cross = { features = ["cross"], no-default-feature = true }

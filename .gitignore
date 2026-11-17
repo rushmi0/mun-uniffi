@@ -1,0 +1,8 @@
+/target
+.idea
+.claude
+.pixi
+.toolchains
+
+# Python bytecode
+__pycache__/

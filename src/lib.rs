@@ -1,6 +1,6 @@
 mod engine;
 
-pub use engine::{set_temp_dir, HostError, HostFunction, MunEngine, MunError, MunType, MunValue};
+pub use engine::{HostError, HostFunction, MunEngine, MunError, MunType, MunValue, set_temp_dir};
 
 #[uniffi::export]
 pub fn add(left: u64, right: u64) -> u64 {

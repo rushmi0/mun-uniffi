@@ -25,7 +25,6 @@ kotlin {
         compileSdk = libs.versions.android.compileSdk.get().toInt()
         minSdk = libs.versions.android.minSdk.get().toInt()
 
-        // Ship the JNA/uniffi keep rules to apps, so R8 does not strip them.
         optimization {
             consumerKeepRules.apply {
                 publish = true
@@ -33,7 +32,7 @@ kotlin {
             }
         }
 
-        withJava() // enable java compilation support
+        withJava()
         withHostTestBuilder {}.configure {}
         withDeviceTestBuilder {
             sourceSetTreeName = "test"
@@ -104,7 +103,7 @@ mavenPublishing {
 
     //signAllPublications()
 
-    coordinates(group.toString(), "library", version.toString())
+    coordinates(group.toString(), "mun-kmp", version.toString())
 
     pom {
         name = "My library"

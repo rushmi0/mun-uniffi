@@ -16,4 +16,3 @@ mun_compiler = { path = "../crates/mun_compiler" }
 mun_runtime = { path = "../crates/mun_runtime" }
 tempfile = "3.27.0"
 thiserror = "2.0.20"
-libffi = "5"

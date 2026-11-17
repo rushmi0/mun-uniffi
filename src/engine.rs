@@ -5,13 +5,13 @@
 //! same library, which the runtime picks up through its regular hot-reload
 //! mechanism, so state that lives in the runtime survives the update.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use libffi::low::{ffi_arg, ffi_cif, ffi_sarg};
-use libffi::middle::{Cif, ClosureOnce};
 use mun_compiler::{Config, DisplayColor, Driver, PathOrInline, RelativePathBuf};
 use mun_runtime::{
     FunctionDefinition, FunctionPrototype, FunctionSignature, HasStaticType,
@@ -132,17 +132,16 @@ impl MunType {
         }
     }
 
-    fn ffi_type(self) -> libffi::middle::Type {
+    /// The suffix of the host entry points for this type, e.g. `__host_arg_i32`.
+    fn suffix(self) -> &'static str {
         match self {
-            Self::Unit => libffi::middle::Type::void(),
-            // Mun passes `bool` as an LLVM `i1`, which the C ABI lowers to a byte.
-            Self::Bool => libffi::middle::Type::u8(),
-            Self::I32 => libffi::middle::Type::i32(),
-            Self::I64 => libffi::middle::Type::i64(),
-            Self::F32 => libffi::middle::Type::f32(),
-            Self::F64 => libffi::middle::Type::f64(),
-            // A pointer to the array's GC handle
-            Self::Str => libffi::middle::Type::pointer(),
+            Self::Unit => "unit",
+            Self::Bool => "bool",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+            Self::Str => "str",
         }
     }
 }
@@ -245,12 +244,10 @@ fn android_cache_dir() -> Option<std::path::PathBuf> {
 #[derive(uniffi::Object)]
 pub struct MunEngine {
     // Declared before `out_dir` so the runtime unloads the library before the
-    // directory holding it is removed, and before `host_fns` so the library no
-    // longer references their code when it is freed.
+    // directory holding it is removed.
     session: Mutex<Option<Session>>,
-    host_fns: Mutex<Vec<HostFn>>,
-    /// The first failure of a host function during the current call into Mun.
-    host_error: Arc<Mutex<Option<String>>>,
+    /// Indexed by the id the generated Mun wrappers pass to `__host_call_*`.
+    host_fns: Mutex<Arc<Vec<HostFn>>>,
     out_dir: TempDir,
 }
 
@@ -278,8 +275,7 @@ impl MunEngine {
         })?;
         Ok(Arc::new(Self {
             session: Mutex::new(None),
-            host_fns: Mutex::new(Vec::new()),
-            host_error: Arc::default(),
+            host_fns: Mutex::default(),
             out_dir,
         }))
     }
@@ -321,13 +317,12 @@ impl MunEngine {
             )));
         }
 
-        host_fns.push(HostFn::new(
+        Arc::make_mut(&mut host_fns).push(HostFn {
             name,
             arg_types,
             return_type,
             func,
-            Arc::clone(&self.host_error),
-        ));
+        });
         Ok(())
     }
 
@@ -337,12 +332,11 @@ impl MunEngine {
     /// Returns the result of `main`, or `null` if there is no such function.
     pub fn eval(&self, source: String) -> Result<Option<MunValue>, MunError> {
         let mut session = self.lock();
-        let source = declare_host_fns(source, &lock(&self.host_fns));
+        let source = with_host_fns(source, &lock(&self.host_fns));
         if let Some(current) = session.as_mut() {
             current.reload(source)?;
         } else {
-            let host_fns = lock(&self.host_fns);
-            *session = Some(Session::load(&self.out_dir, source, &host_fns)?);
+            *session = Some(Session::load(&self.out_dir, source)?);
         }
 
         let current = session.as_ref().expect("session was just loaded");
@@ -380,9 +374,9 @@ impl MunEngine {
         name: &str,
         args: &[MunValue],
     ) -> Result<MunValue, MunError> {
-        lock(&self.host_error).take();
-        let result = session.call(name, args);
-        match lock(&self.host_error).take() {
+        let host_fns = Arc::clone(&lock(&self.host_fns));
+        let (result, host_error) = HostCall::run(host_fns, || session.call(name, args));
+        match host_error {
             Some(message) => Err(MunError::Host { message }),
             None => result,
         }
@@ -397,48 +391,195 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// A [`HostFunction`] exposed to Mun as a C function pointer, created at
-/// runtime by a libffi closure matching the registered signature.
+/// A registered [`HostFunction`] and its signature.
+#[derive(Clone)]
 struct HostFn {
     name: String,
     arg_types: Vec<MunType>,
     return_type: MunType,
-    closure: ClosureOnce,
+    func: Arc<dyn HostFunction>,
 }
 
-// SAFETY: the closure's code and `HostCallback` userdata are never mutated
-// after creation, and `HostCallback` itself is `Send + Sync`.
-unsafe impl Send for HostFn {}
+// Mun calls host functions through a fixed set of native entry points, the way
+// QuickJS calls every Rust closure through one C function in rquickjs: each
+// registered function gets a generated Mun wrapper (see `with_host_fns`) that
+// pushes its arguments with `__host_arg_<type>` and then calls
+// `__host_call_<return type>(id)`. The id selects the `HostFn`, so no native
+// code has to be generated at runtime for each signature.
 
-impl HostFn {
-    fn new(
-        name: String,
-        arg_types: Vec<MunType>,
-        return_type: MunType,
-        func: Arc<dyn HostFunction>,
-        error: Arc<Mutex<Option<String>>>,
-    ) -> Self {
-        let cif = Cif::new(
-            arg_types.iter().map(|ty| ty.ffi_type()),
-            return_type.ffi_type(),
-        );
-        let callback = HostCallback {
-            name: name.clone(),
-            arg_types: arg_types.clone(),
-            return_type,
-            func,
-            error,
+/// The host functions and pending arguments of the call into Mun running on
+/// this thread.
+struct HostCall {
+    host_fns: Arc<Vec<HostFn>>,
+    args: Vec<MunValue>,
+    /// The first host function failure, reported once Mun code returns.
+    error: Option<String>,
+}
+
+thread_local! {
+    static HOST_CALL: RefCell<Option<HostCall>> = const { RefCell::new(None) };
+}
+
+impl HostCall {
+    /// Runs `f`, a call into Mun, with `host_fns` available to the entry points.
+    fn run<T>(host_fns: Arc<Vec<HostFn>>, f: impl FnOnce() -> T) -> (T, Option<String>) {
+        let call = HostCall {
+            host_fns,
+            args: Vec::new(),
+            error: None,
         };
-        Self {
-            name,
-            arg_types,
-            return_type,
-            closure: ClosureOnce::new(cif, call_host_fn, callback),
-        }
+        let outer = HOST_CALL.replace(Some(call));
+        let result = f();
+        let call = HOST_CALL.replace(outer);
+        (result, call.and_then(|call| call.error))
+    }
+
+    fn push_arg(value: MunValue) {
+        HOST_CALL.with_borrow_mut(|call| {
+            if let Some(call) = call {
+                call.args.push(value);
+            }
+        });
+    }
+
+    /// Takes the pushed arguments for a call to host function `id`.
+    fn take(id: i64) -> Option<(HostFn, Vec<MunValue>)> {
+        HOST_CALL.with_borrow_mut(|call| {
+            let call = call.as_mut()?;
+            let host_fn = usize::try_from(id)
+                .ok()
+                .and_then(|id| call.host_fns.get(id))?;
+            Some((host_fn.clone(), std::mem::take(&mut call.args)))
+        })
+    }
+
+    fn fail(message: String) {
+        HOST_CALL.with_borrow_mut(|call| {
+            if let Some(call) = call {
+                call.error.get_or_insert(message);
+            }
+        });
     }
 }
 
-impl IntoFunctionDefinition for &HostFn {
+/// Calls host function `id` with the pushed arguments and converts its return
+/// value to `T`. On failure, records the error and returns zero.
+fn call_host<T: FromMunValue + HasStaticType + Default>(id: i64) -> T {
+    let Some((host_fn, args)) = HostCall::take(id) else {
+        return T::default();
+    };
+    // The callback runs without `HOST_CALL` borrowed, so it may call into
+    // another engine.
+    let result = match host_fn.func.call(args) {
+        Ok(value) => convert::<T>(value).map_err(|err| {
+            format!(
+                "host function '{}' returned an invalid value: {err}",
+                host_fn.name
+            )
+        }),
+        Err(HostError::Failed { reason }) => {
+            Err(format!("host function '{}' failed: {reason}", host_fn.name))
+        }
+    };
+    result.unwrap_or_else(|message| {
+        HostCall::fail(message);
+        T::default()
+    })
+}
+
+// Mun passes `bool` as an LLVM `i1`, which the C ABI lowers to a byte.
+extern "C" fn host_arg_bool(value: u8) {
+    HostCall::push_arg(MunValue::Bool { value: value != 0 });
+}
+
+extern "C" fn host_arg_i32(value: i32) {
+    HostCall::push_arg(MunValue::I32 { value });
+}
+
+extern "C" fn host_arg_i64(value: i64) {
+    HostCall::push_arg(MunValue::I64 { value });
+}
+
+extern "C" fn host_arg_f32(value: f32) {
+    HostCall::push_arg(MunValue::F32 { value });
+}
+
+extern "C" fn host_arg_f64(value: f64) {
+    HostCall::push_arg(MunValue::F64 { value });
+}
+
+extern "C" fn host_arg_str(handle: *const *const ArrayHeader) {
+    // SAFETY: Mun passes the GC handle of a live `[u8]` array.
+    let value = unsafe { read_str(handle) };
+    HostCall::push_arg(MunValue::Str { value });
+}
+
+extern "C" fn host_call_unit(id: i64) {
+    call_host::<()>(id);
+}
+
+extern "C" fn host_call_bool(id: i64) -> bool {
+    call_host(id)
+}
+
+extern "C" fn host_call_i32(id: i64) -> i32 {
+    call_host(id)
+}
+
+extern "C" fn host_call_i64(id: i64) -> i64 {
+    call_host(id)
+}
+
+extern "C" fn host_call_f32(id: i64) -> f32 {
+    call_host(id)
+}
+
+extern "C" fn host_call_f64(id: i64) -> f64 {
+    call_host(id)
+}
+
+/// A native function Mun code can call through an `extern fn` declaration.
+struct EntryPoint {
+    name: String,
+    arg_types: Vec<MunType>,
+    return_type: MunType,
+    fn_ptr: *const c_void,
+}
+
+impl EntryPoint {
+    fn new(
+        name: &str,
+        ty: MunType,
+        arg_types: &[MunType],
+        return_type: MunType,
+        fn_ptr: *const c_void,
+    ) -> Self {
+        Self {
+            name: format!("__host_{name}_{}", ty.suffix()),
+            arg_types: arg_types.to_vec(),
+            return_type,
+            fn_ptr,
+        }
+    }
+
+    /// The Mun `extern fn` declaration of this entry point.
+    fn declaration(&self) -> String {
+        let params = self
+            .arg_types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| format!("arg{i}: {}", ty.mun_name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "extern fn {}({params}){};",
+            self.name,
+            return_suffix(self.return_type)
+        )
+    }
+}
+
+impl IntoFunctionDefinition for &EntryPoint {
     fn into<S: Into<String>>(self, name: S) -> FunctionDefinition {
         FunctionDefinition {
             prototype: FunctionPrototype {
@@ -448,125 +589,29 @@ impl IntoFunctionDefinition for &HostFn {
                     return_type: self.return_type.type_info(),
                 },
             },
-            fn_ptr: *self.closure.code_ptr() as *const c_void,
+            fn_ptr: self.fn_ptr,
         }
     }
 }
 
-/// The userdata of a [`HostFn`] closure.
-struct HostCallback {
-    name: String,
-    arg_types: Vec<MunType>,
-    return_type: MunType,
-    func: Arc<dyn HostFunction>,
-    error: Arc<Mutex<Option<String>>>,
-}
-
-impl HostCallback {
-    /// # Safety
-    ///
-    /// `args` must point to one pointer per entry of `arg_types`, each to a
-    /// value of that type.
-    unsafe fn args(&self, args: *const *const c_void) -> Vec<MunValue> {
-        self.arg_types
-            .iter()
-            .enumerate()
-            .map(|(i, ty)| {
-                // SAFETY: guaranteed by the caller.
-                let arg = unsafe { *args.add(i) };
-                // SAFETY: libffi passes each argument as the type in the `Cif`.
-                unsafe {
-                    match ty {
-                        MunType::Bool => MunValue::Bool {
-                            value: *arg.cast::<u8>() != 0,
-                        },
-                        MunType::I32 => MunValue::I32 {
-                            value: *arg.cast::<i32>(),
-                        },
-                        MunType::I64 => MunValue::I64 {
-                            value: *arg.cast::<i64>(),
-                        },
-                        MunType::F32 => MunValue::F32 {
-                            value: *arg.cast::<f32>(),
-                        },
-                        MunType::F64 => MunValue::F64 {
-                            value: *arg.cast::<f64>(),
-                        },
-                        MunType::Str => MunValue::Str {
-                            value: read_str(*arg.cast::<*const *const ArrayHeader>()),
-                        },
-                        MunType::Unit => unreachable!("rejected by register_fn"),
-                    }
-                }
-            })
-            .collect()
-    }
-
-    fn fail(&self, message: String) {
-        lock(&self.error).get_or_insert(message);
-    }
-
-    /// Converts a host function's return value to `T`, or returns zero if it
-    /// failed or returned a value of the wrong type.
-    fn typed<T: FromMunValue + HasStaticType + Default>(&self, value: Option<MunValue>) -> T {
-        let Some(value) = value else {
-            return T::default();
-        };
-        convert(value).unwrap_or_else(|err| {
-            self.fail(format!(
-                "host function '{}' returned an invalid value: {err}",
-                self.name
-            ));
-            T::default()
-        })
-    }
-}
-
-/// The libffi closure callback shared by all host functions.
-unsafe extern "C" fn call_host_fn(
-    _cif: &ffi_cif,
-    result: &mut ffi_arg,
-    args: *const *const c_void,
-    userdata: &mut Option<HostCallback>,
-) {
-    let callback = userdata.as_ref().expect("the callback is never taken");
-    // SAFETY: libffi passes the arguments described by the closure's `Cif`,
-    // which was built from `arg_types`.
-    let args = unsafe { callback.args(args) };
-    let value = match callback.func.call(args) {
-        Ok(value) => Some(value),
-        Err(HostError::Failed { reason }) => {
-            callback.fail(format!(
-                "host function '{}' failed: {reason}",
-                callback.name
-            ));
-            None
-        }
-    };
-
-    let result: *mut ffi_arg = result;
-    // SAFETY: libffi provides a result buffer of at least `ffi_arg` bytes and
-    // of the return type's size; integers narrower than `ffi_arg` are widened.
-    unsafe {
-        match callback.return_type {
-            MunType::Unit => {
-                if let Some(value) = value.filter(|value| *value != MunValue::Unit) {
-                    callback.fail(format!(
-                        "host function '{}' must return Unit, got {value:?}",
-                        callback.name
-                    ));
-                }
-            }
-            MunType::Bool => result.write(ffi_arg::from(callback.typed::<bool>(value))),
-            MunType::I32 => result
-                .cast::<ffi_sarg>()
-                .write(ffi_sarg::from(callback.typed::<i32>(value))),
-            MunType::I64 => result.cast::<i64>().write(callback.typed(value)),
-            MunType::F32 => result.cast::<f32>().write(callback.typed(value)),
-            MunType::F64 => result.cast::<f64>().write(callback.typed(value)),
-            MunType::Str => unreachable!("rejected by register_fn"),
-        }
-    }
+fn entry_points() -> Vec<EntryPoint> {
+    use MunType::{Bool, F32, F64, I32, I64, Str, Unit};
+    let arg = |ty, fn_ptr| EntryPoint::new("arg", ty, &[ty], Unit, fn_ptr);
+    let call = |ty, fn_ptr| EntryPoint::new("call", ty, &[I64], ty, fn_ptr);
+    vec![
+        arg(Bool, host_arg_bool as *const c_void),
+        arg(I32, host_arg_i32 as *const c_void),
+        arg(I64, host_arg_i64 as *const c_void),
+        arg(F32, host_arg_f32 as *const c_void),
+        arg(F64, host_arg_f64 as *const c_void),
+        arg(Str, host_arg_str as *const c_void),
+        call(Unit, host_call_unit as *const c_void),
+        call(Bool, host_call_bool as *const c_void),
+        call(I32, host_call_i32 as *const c_void),
+        call(I64, host_call_i64 as *const c_void),
+        call(F32, host_call_f32 as *const c_void),
+        call(F64, host_call_f64 as *const c_void),
+    ]
 }
 
 /// The header of a Mun array, followed by its elements.
@@ -591,42 +636,94 @@ unsafe fn read_str(handle: *const *const ArrayHeader) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Appends an `extern fn` declaration for each host function that `source`
-/// does not declare itself, so Mun code can call host functions, such as a
-/// registered `println`, without declaring them. Appending keeps the line
+/// Makes the host functions callable from `source`: appends the entry point
+/// declarations and a wrapper for each host function the source does not
+/// define itself. The source may still declare a host function as
+/// `extern fn name(..);`, as plain Mun requires; that declaration is blanked
+/// out in favor of the wrapper. Only appending and blanking keep the line
 /// numbers in diagnostics intact.
-fn declare_host_fns(mut source: String, host_fns: &[HostFn]) -> String {
-    let declarations: String = host_fns
-        .iter()
-        .filter(|host_fn| !declares_fn(&source, &host_fn.name))
-        .map(|host_fn| {
-            let params = host_fn
-                .arg_types
-                .iter()
-                .enumerate()
-                .map(|(i, ty)| format!("arg{i}: {}", ty.mun_name()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let ret = match host_fn.return_type {
-                MunType::Unit => String::new(),
-                ty => format!(" -> {}", ty.mun_name()),
-            };
-            format!("\nextern fn {}({params}){ret};", host_fn.name)
-        })
-        .collect();
-    source.push_str(&declarations);
+fn with_host_fns(mut source: String, host_fns: &[HostFn]) -> String {
+    if host_fns.is_empty() {
+        return source;
+    }
+    for host_fn in host_fns {
+        while let Some(range) = extern_declaration(&source, &host_fn.name) {
+            let blank: String = source[range.clone()]
+                .chars()
+                .map(|c| if c == '\n' { '\n' } else { ' ' })
+                .collect();
+            source.replace_range(range, &blank);
+        }
+    }
+
+    for entry_point in entry_points() {
+        source.push('\n');
+        source.push_str(&entry_point.declaration());
+    }
+    for (id, host_fn) in host_fns.iter().enumerate() {
+        if !defines_fn(&source, &host_fn.name) {
+            source.push('\n');
+            source.push_str(&wrapper(id, host_fn));
+        }
+    }
     source
 }
 
-/// Returns whether `source` declares a function called `name`.
-fn declares_fn(source: &str, name: &str) -> bool {
-    source.match_indices(name).any(|(start, _)| {
-        let is_fn_keyword = source[..start]
-            .trim_end()
-            .strip_suffix("fn")
-            .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphanumeric() || c == '_'));
-        is_fn_keyword && source[start + name.len()..].trim_start().starts_with('(')
+/// The Mun function that forwards a call to host function `id`.
+fn wrapper(id: usize, host_fn: &HostFn) -> String {
+    let params = host_fn
+        .arg_types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| format!("arg{i}: {}", ty.mun_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let push_args: String = host_fn
+        .arg_types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| format!("__host_arg_{}(arg{i}); ", ty.suffix()))
+        .collect();
+    format!(
+        "fn {}({params}){} {{ {push_args}__host_call_{}({id}) }}",
+        host_fn.name,
+        return_suffix(host_fn.return_type),
+        host_fn.return_type.suffix()
+    )
+}
+
+fn return_suffix(ty: MunType) -> String {
+    match ty {
+        MunType::Unit => String::new(),
+        ty => format!(" -> {}", ty.mun_name()),
+    }
+}
+
+/// Byte ranges of `fn name(` in `source`, each starting at its `fn` keyword.
+fn fn_items<'a>(source: &'a str, name: &'a str) -> impl Iterator<Item = Range<usize>> + 'a {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    source.match_indices(name).filter_map(move |(start, _)| {
+        let before = &source[..start];
+        let keyword = before.trim_end().strip_suffix("fn")?;
+        let separated = before.ends_with(char::is_whitespace) && !keyword.ends_with(is_ident);
+        let is_call = source[start + name.len()..].trim_start().starts_with('(');
+        (separated && is_call).then(|| keyword.len()..start + name.len())
     })
+}
+
+/// The range of an `extern fn name(..);` declaration in `source`, if any.
+fn extern_declaration(source: &str, name: &str) -> Option<Range<usize>> {
+    fn_items(source, name).find_map(|item| {
+        let before = source[..item.start].trim_end();
+        let extern_start = before.strip_suffix("extern")?.len();
+        let end = item.end + source[item.end..].find(';')? + 1;
+        Some(extern_start..end)
+    })
+}
+
+/// Returns whether `source` defines (or declares) a function called `name`.
+fn defines_fn(source: &str, name: &str) -> bool {
+    fn_items(source, name).next().is_some()
 }
 
 /// Calls `runtime.invoke` with argument and return types matching a signature
@@ -686,7 +783,7 @@ macro_rules! invoke_typed {
 unsafe impl Send for Session {}
 
 impl Session {
-    fn load(out_dir: &TempDir, source: String, host_fns: &[HostFn]) -> Result<Self, MunError> {
+    fn load(out_dir: &TempDir, source: String) -> Result<Self, MunError> {
         let config = Config {
             out_dir: Some(out_dir.path().to_path_buf()),
             ..Config::default()
@@ -702,13 +799,13 @@ impl Session {
             .map_err(MunError::compile)?;
 
         let lib_path = driver.assembly_output_path_from_file(file_id);
-        let builder = host_fns
+        let builder = entry_points()
             .iter()
-            .fold(Runtime::builder(lib_path), |builder, host_fn| {
-                builder.insert_fn(host_fn.name.clone(), host_fn)
+            .fold(Runtime::builder(lib_path), |builder, entry_point| {
+                builder.insert_fn(entry_point.name.clone(), entry_point)
             });
         // SAFETY: the library was just produced by the Mun compiler from
-        // `source`, and the host functions outlive the runtime.
+        // `source`, and the entry points are plain functions of this library.
         let runtime = unsafe { builder.finish() }.map_err(MunError::runtime)?;
 
         Ok(Self {
@@ -821,6 +918,12 @@ trait FromMunValue: Sized {
     fn from_mun_value(value: &MunValue) -> Option<Self>;
 }
 
+impl FromMunValue for () {
+    fn from_mun_value(value: &MunValue) -> Option<Self> {
+        (*value == MunValue::Unit).then_some(())
+    }
+}
+
 impl FromMunValue for bool {
     fn from_mun_value(value: &MunValue) -> Option<Self> {
         match *value {
@@ -882,7 +985,6 @@ fn unsupported(ty: &Type) -> MunError {
         ty.name()
     ))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1199,6 +1301,56 @@ mod tests {
         );
         let err = engine.call("b".into(), vec![]).unwrap_err();
         assert!(matches!(err, MunError::Host { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn host_fn_named_like_a_libc_symbol() {
+        // Calls to `log` must reach the host, not libm's `log`.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let engine = MunEngine::new().unwrap();
+        let seen = Arc::clone(&calls);
+        engine
+            .register_fn(
+                "log".into(),
+                vec![MunType::F64],
+                MunType::Unit,
+                host(move |args| {
+                    seen.lock().unwrap().extend(args);
+                    Ok(MunValue::Unit)
+                }),
+            )
+            .unwrap();
+        engine.eval("pub fn main() { log(2.5) }".into()).unwrap();
+        assert_eq!(*calls.lock().unwrap(), [MunValue::F64 { value: 2.5 }]);
+    }
+
+    #[test]
+    fn extern_fn_receives_strings() {
+        let engine = MunEngine::new().unwrap();
+        engine
+            .register_fn(
+                "len".into(),
+                vec![MunType::Str, MunType::I32],
+                MunType::I64,
+                host(|args| match &args[..] {
+                    [MunValue::Str { value }, MunValue::I32 { value: extra }] => {
+                        Ok(MunValue::I64 {
+                            value: value.len() as i64 + i64::from(*extra),
+                        })
+                    }
+                    _ => Err(HostError::Failed {
+                        reason: format!("unexpected arguments {args:?}"),
+                    }),
+                }),
+            )
+            .unwrap();
+        let result = engine
+            .eval(
+                // Mun strings are `[u8]` arrays of UTF-8 bytes; this is "héllo".
+                "pub fn main() -> i64 { len([104, 195, 169, 108, 108, 111], 1) }".into(),
+            )
+            .unwrap();
+        assert_eq!(result, Some(MunValue::I64 { value: 7 }));
     }
 
     #[test]

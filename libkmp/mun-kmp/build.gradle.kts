@@ -7,7 +7,7 @@ plugins {
     id("signing")
 }
 
-group = "org.example"
+group = "org.siamdev"
 version = "1.0.0"
 
 kotlin {
@@ -21,7 +21,7 @@ kotlin {
         }
     }
     androidLibrary {
-        namespace = "org.example.libkmp"
+        namespace = "org.siamdev.mun"
         compileSdk = libs.versions.android.compileSdk.get().toInt()
         minSdk = libs.versions.android.minSdk.get().toInt()
 

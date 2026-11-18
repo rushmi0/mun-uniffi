@@ -9,16 +9,19 @@ import sys
 import tempfile
 from pathlib import Path
 
-from install_toolchain import (
-    ARTIFACT, ROOT, BuildError, build_and_install_llvm, llvm_build_dir, llvm_cmake_args,
-    llvm_needs_build, llvm_prefix, log, platform_main, require_llvm, run, select_targets,
-    write_file, write_llvm_config,
+from toolchain import (
+    ARTIFACT, GNU_CFLAGS, GNU_CXXFLAGS, ROOT, BuildError, base_cmake_args, build_and_install, build_dir_for,
+    log, needs_build, prefix_for, require_installed, run, run_platform_build, select_targets, write_file,
+    write_llvm_config,
 )
 
 PLATFORM = "linux"
+
+# glibc versions to link against. cargo-zigbuild takes the version as a suffix of the Rust target.
 GLIBC = os.environ.get("GLIBC", "2.17")
 GLIBC_RISCV64 = os.environ.get("GLIBC_RISCV64", "2.27")
 
+# Rust target -> zig target, LLVM CPU flags and the values CMake needs for the system.
 TARGETS = {
     "x86_64-unknown-linux-gnu":       {"zig": "x86_64-linux-gnu",     "cpu": "",                                       "system": "Linux",   "processor": "x86_64"},
     "aarch64-unknown-linux-gnu":      {"zig": "aarch64-linux-gnu",    "cpu": "",                                       "system": "Linux",   "processor": "aarch64"},
@@ -33,11 +36,11 @@ TARGETS = {
     "x86_64-unknown-freebsd":         {"zig": "x86_64-freebsd",       "cpu": "",                                       "system": "FreeBSD", "processor": "x86_64"},
 }
 
-LLVM_CFLAGS = "-D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS"
-LLVM_CXXFLAGS = f"-std=c++14 -fno-exceptions {LLVM_CFLAGS}"
 LLVM_SYSTEM_LIBS = "-lpthread -ldl -lm"
 LIBCXX_ARCHIVES = ("libc++.a", "libc++abi.a")
 
+# Compiler wrapper for `zig cc` / `zig c++`. Compile-only modes (-c, -S, -E) pass
+# their arguments through unchanged; in every other mode the wrapper drops -std=* flags.
 ZIG_COMPILER_WRAPPER = """#!/bin/sh
 case " $* " in
     *" -c "*|*" -S "*|*" -E "*) ;;
@@ -46,6 +49,7 @@ esac
 exec "{zigbuild}" zig {tool} -- -target {zig_target} {cpu} "$@"
 """
 
+# Wrapper for `ar` and `ranlib`, which are plain zig subcommands.
 ZIG_TOOL_WRAPPER = """#!/bin/sh
 exec zig {tool} "$@"
 """
@@ -56,6 +60,7 @@ def resolve_targets(names: list[str]) -> list[str]:
 
 
 def glibc_suffix(target: str) -> str:
+    """The glibc version suffix for `target`, or "" for targets that are not glibc-based."""
     if target.startswith("riscv64gc-") and target.endswith("-gnu"):
         return f".{GLIBC_RISCV64}"
     if target.endswith(("-gnu", "-gnueabihf")):
@@ -67,13 +72,24 @@ def zig_target(target: str) -> str:
     return TARGETS[target]["zig"] + glibc_suffix(target)
 
 
+def cargo_command(target: str) -> list[str]:
+    return ["cargo", "zigbuild", "--lib", "--release", "--target", target + glibc_suffix(target)]
+
+
+# ---------------------------------------------------------------------------
+# Compiler wrappers
+# ---------------------------------------------------------------------------
+
 def zig_wrapper_signature(target: str, zigbuild: str) -> str:
+    """Text that identifies the wrapper configuration for `target`.
+
+    Stored next to the wrappers so a change of target or zig path forces a clean rebuild.
+    """
     return f'exec "{zigbuild}" zig $tool -- -target {zig_target(target)} {TARGETS[target]["cpu"]}\n'
 
 
 def zig_wrappers(target: str, zigbuild: str) -> dict[str, str]:
-    """File name -> content of the compiler wrappers CMake builds LLVM with, so LLVM
-    uses the same zig front end, libc and libc++ that cargo-zigbuild links with."""
+    """File name -> content of each wrapper CMake uses to build LLVM for `target`."""
     compiler = {
         tool: ZIG_COMPILER_WRAPPER.format(zigbuild=zigbuild, tool=tool, zig_target=zig_target(target),
                                           cpu=TARGETS[target]["cpu"])
@@ -82,11 +98,26 @@ def zig_wrappers(target: str, zigbuild: str) -> dict[str, str]:
     return compiler | {tool: ZIG_TOOL_WRAPPER.format(tool=tool) for tool in ("ar", "ranlib")}
 
 
+def write_zig_wrappers(target: str, build: Path, zigbuild: str) -> None:
+    signature_file = build / "zig" / "target"
+    signature = zig_wrapper_signature(target, zigbuild)
+    if signature_file.is_file() and signature_file.read_text() != signature:
+        log(f"zig target changed, removing old build dir {build}")
+        shutil.rmtree(build)
+    write_file(signature_file, signature)
+    for name, text in zig_wrappers(target, zigbuild).items():
+        write_file(build / "zig" / name, text, executable=True)
+
+
+# ---------------------------------------------------------------------------
+# CMake and installation
+# ---------------------------------------------------------------------------
+
 def cmake_args(target: str) -> list[str]:
     info = TARGETS[target]
-    build = llvm_build_dir(PLATFORM, target)
+    build = build_dir_for(PLATFORM, target)
     zig_dir = build / "zig"
-    args = llvm_cmake_args(build, llvm_prefix(PLATFORM, target), target, "AArch64;ARM;X86;RISCV") + [
+    args = base_cmake_args(build, prefix_for(PLATFORM, target), target) + [
         f"-DCMAKE_SYSTEM_NAME={info['system']}",
         f"-DCMAKE_SYSTEM_PROCESSOR={info['processor']}",
         f"-DCMAKE_C_COMPILER={zig_dir / 'cc'}",
@@ -103,35 +134,13 @@ def cmake_args(target: str) -> list[str]:
     return args
 
 
-def cargo_command(target: str) -> list[str]:
-    # cargo-zigbuild takes the glibc version as a suffix of the Rust target.
-    return ["cargo", "zigbuild", "--lib", "--release", "--target", target + glibc_suffix(target)]
-
-
 def find_archive(compiler_output: str, archive: str) -> str | None:
     return next((word for word in compiler_output.split() if word.endswith(f"/{archive}")), None)
 
 
-def zigbuild_path(env: dict) -> str:
-    path = os.environ.get("ZIGBUILD") or shutil.which("cargo-zigbuild", path=env["PATH"])
-    if not path:
-        raise BuildError("cargo-zigbuild not found (it comes from the pixi `cross` env)")
-    return path
-
-
-def write_zig_wrappers(target: str, build: Path, zigbuild: str) -> None:
-    signature_file = build / "zig" / "target"
-    signature = zig_wrapper_signature(target, zigbuild)
-    if signature_file.is_file() and signature_file.read_text() != signature:
-        log(f"zig target changed, removing old build dir {build}")
-        shutil.rmtree(build)
-    write_file(signature_file, signature)
-    for name, text in zig_wrappers(target, zigbuild).items():
-        write_file(build / "zig" / name, text, executable=True)
-
-
 def copy_zig_libcxx(target: str, zigbuild: str, env: dict) -> None:
-    dest = llvm_prefix(PLATFORM, target) / "libcxx"
+    """Copy zig's libc++ archives into the LLVM prefix, found by asking zig to link a probe."""
+    dest = prefix_for(PLATFORM, target) / "libcxx"
     if all((dest / archive).is_file() for archive in LIBCXX_ARCHIVES):
         return
     log(f"locating zig's libc++ for {target}")
@@ -150,8 +159,9 @@ def copy_zig_libcxx(target: str, zigbuild: str, env: dict) -> None:
 
 
 def finish_llvm_install(target: str, zigbuild: str, env: dict) -> None:
-    prefix = llvm_prefix(PLATFORM, target)
-    write_llvm_config(prefix, LLVM_CFLAGS, LLVM_CXXFLAGS, "libLLVM*.a", LLVM_SYSTEM_LIBS)
+    """Write the llvm-config stand-in and the placeholder libraries llvm-sys expects."""
+    prefix = prefix_for(PLATFORM, target)
+    write_llvm_config(prefix, GNU_CFLAGS, GNU_CXXFLAGS, "libLLVM*.a", LLVM_SYSTEM_LIBS)
     write_file(prefix / "lib" / "libffi.so", "INPUT()\n")
     if "-musl" in target:
         for lib in ("pthread", "dl", "m", "c++"):
@@ -159,24 +169,36 @@ def finish_llvm_install(target: str, zigbuild: str, env: dict) -> None:
     copy_zig_libcxx(target, zigbuild, env)
 
 
+# ---------------------------------------------------------------------------
+# Build stages
+# ---------------------------------------------------------------------------
+
+def zigbuild_path(env: dict) -> str:
+    path = os.environ.get("ZIGBUILD") or shutil.which("cargo-zigbuild", path=env["PATH"])
+    if not path:
+        raise BuildError("cargo-zigbuild not found (it comes from the pixi `cross` env)")
+    return path
+
+
 def build_llvm(target: str, env: dict) -> None:
     zigbuild = zigbuild_path(env)
-    if llvm_needs_build(llvm_prefix(PLATFORM, target), target):
-        build = llvm_build_dir(PLATFORM, target)
+    prefix = prefix_for(PLATFORM, target)
+    if needs_build(prefix, target):
+        build = build_dir_for(PLATFORM, target)
         write_zig_wrappers(target, build, zigbuild)
-        build_and_install_llvm(cmake_args(target), build, env)
+        build_and_install(cmake_args(target), build, env)
     finish_llvm_install(target, zigbuild, env)
 
 
 def build_library(target: str, env: dict) -> None:
-    prefix = llvm_prefix(PLATFORM, target)
-    require_llvm(prefix, f"python3 scripts/build_llvm_linux.py llvm {target}")
+    prefix = prefix_for(PLATFORM, target)
+    require_installed(prefix, f"python3 scripts/build_llvm_linux.py llvm {target}")
     log(f"building lib{ARTIFACT}.so for {target}")
     run(cargo_command(target), env={**env, "LLVM_SYS_140_PREFIX": str(prefix)}, cwd=ROOT)
 
 
 def main(argv: list[str] | None = None) -> int:
-    return platform_main(__file__, __doc__, argv, resolve_targets, build_llvm, build_library)
+    return run_platform_build(__file__, __doc__, argv, resolve_targets, build_llvm, build_library)
 
 
 if __name__ == "__main__":

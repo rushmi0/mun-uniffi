@@ -1,8 +1,8 @@
-import org.example.libkmp.HostFunction
-import org.example.libkmp.MunEngine
-import org.example.libkmp.MunException
-import org.example.libkmp.MunType
-import org.example.libkmp.MunValue
+import org.siamdev.mun.HostFunction
+import org.siamdev.mun.MunEngine
+import org.siamdev.mun.MunException
+import org.siamdev.mun.MunType
+import org.siamdev.mun.MunValue
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith

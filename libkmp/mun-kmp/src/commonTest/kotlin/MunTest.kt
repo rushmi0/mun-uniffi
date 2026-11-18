@@ -1,4 +1,4 @@
-import org.example.libkmp.add
+import org.siamdev.mun.add
 import kotlin.test.Test
 import kotlin.test.assertEquals
 

@@ -1,18 +1,3 @@
-"""Shared build machinery for the LLVM 14 cross-compilation scripts.
-
-Everything the scripts in this folder share lives in this one module:
-
-  - paths, pinned versions and environment overrides
-  - errors, logging and subprocess helpers
-  - file writes, checksummed downloads and archive extraction
-  - host checks and re-execution inside the pixi `cross` environment
-  - LLVM 14 install layout, CMake arguments and the llvm-config stand-in
-  - Android NDK and SDK discovery and installation
-  - the pinned Rust toolchain and cargo helper tools
-  - the setup steps run by install_toolchain.py
-  - the `llvm | lib | all` entry point shared by the build_llvm_*.py scripts
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -36,9 +21,6 @@ from functools import partial
 from pathlib import Path
 from typing import NamedTuple
 
-# ===========================================================================
-# Configuration
-# ===========================================================================
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPTS_DIR.parent
@@ -88,10 +70,6 @@ REQUIRED_COMMANDS = [
 ]
 
 
-# ===========================================================================
-# Errors, logging and subprocess helpers
-# ===========================================================================
-
 class BuildError(Exception):
     """A failure with a message meant for the user; reported without a traceback."""
 
@@ -130,10 +108,6 @@ def capture(cmd: list, env: dict | None = None, cwd: Path | None = None) -> str:
     return result.stdout.strip()
 
 
-# ===========================================================================
-# Files: writes, checksummed downloads and archive extraction
-# ===========================================================================
-
 def write_file(path: Path, text: str, executable: bool = False) -> None:
     """Write `text` to `path`, touching the file only when its content changes."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,7 +136,6 @@ def download(url: str, sha256: str, attempts: int = 3) -> Path:
         log(f"checksum mismatch, downloading {dest.name} again")
         dest.unlink()
 
-    # Download to a .part file so an interrupted transfer never looks like a finished one.
     part_file = dest.with_name(dest.name + ".part")
     _fetch(url, part_file, attempts)
 
@@ -219,11 +192,6 @@ def _extract_zip(archive: Path, dest: Path) -> None:
 
 
 def unpack_top_dir(archive: Path, dest: Path, top_dir_glob: str) -> None:
-    """Extract `archive` and move its single top-level directory to `dest`.
-
-    Extraction happens in a staging directory first, so an interrupted run
-    never leaves a half-extracted toolchain behind.
-    """
     staging = dest.parent / f".{dest.name}.partial"
     if staging.exists():
         shutil.rmtree(staging)
@@ -234,10 +202,6 @@ def unpack_top_dir(archive: Path, dest: Path, top_dir_glob: str) -> None:
     matches[0].rename(dest)
     shutil.rmtree(staging)
 
-
-# ===========================================================================
-# Host checks and re-execution inside the pixi `cross` environment
-# ===========================================================================
 
 def build_env() -> dict[str, str]:
     """The current environment with the managed tools directory first on PATH."""
@@ -282,10 +246,6 @@ def select_targets(names: list[str], known: list[str], kind: str) -> list[str]:
     return names or list(known)
 
 
-# ===========================================================================
-# LLVM 14 install layout, CMake configuration and the llvm-config stand-in
-# ===========================================================================
-
 # Targets that every cross build of LLVM is configured with.
 DEFAULT_TARGETS_TO_BUILD = "AArch64;ARM;X86;RISCV"
 
@@ -293,8 +253,7 @@ DEFAULT_TARGETS_TO_BUILD = "AArch64;ARM;X86;RISCV"
 GNU_CFLAGS = "-D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS"
 GNU_CXXFLAGS = f"-std=c++14 -fno-exceptions {GNU_CFLAGS}"
 
-# The installed llvm-config is a target binary, so llvm-sys and lld_rs get a
-# host-side stand-in that describes the installation it lives in.
+
 LLVM_CONFIG_STANDIN = r"""#!/usr/bin/env bash
 prefix="$(cd "$(dirname "$0")/.." && pwd)"
 for arg in "$@"; do
@@ -433,10 +392,6 @@ def write_llvm_config(prefix: Path, cflags: str, cxxflags: str, libnames: str, s
     write_file(prefix / "bin" / "llvm-config", text, executable=True)
 
 
-# ===========================================================================
-# Android NDK and SDK
-# ===========================================================================
-
 def ndk_dir() -> Path:
     """The NDK named by NDK_DIR, else ANDROID_NDK_HOME if it holds an NDK, else the managed copy."""
     if "NDK_DIR" in os.environ:
@@ -502,10 +457,6 @@ def install_sdk(env: dict) -> None:
     run([sdkmanager, f"--sdk_root={MANAGED_SDK}", *packages], env=env)
 
 
-# ===========================================================================
-# Rust toolchain and cargo helper tools
-# ===========================================================================
-
 def pinned_rust_toolchain() -> tuple[str, list[str]]:
     """The channel and cross-compilation targets pinned in rust-toolchain.toml."""
     config = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]
@@ -557,10 +508,6 @@ def cargo_tool_problem(name: str, version: str) -> str | None:
 def install_cargo_tool(name: str, version: str, env: dict) -> None:
     run(["cargo", "install", "--locked", "--root", TOOLS_DIR, f"{name}@{version}"], env=env)
 
-
-# ===========================================================================
-# Setup steps run by install_toolchain.py
-# ===========================================================================
 
 class Step(NamedTuple):
     name: str
@@ -662,9 +609,6 @@ def run_setup(script: str, description: str, argv: list[str] | None = None) -> i
     return 0
 
 
-# ===========================================================================
-# Shared command-line entry point of the build_llvm_*.py scripts
-# ===========================================================================
 
 def run_platform_build(
     script: str,
@@ -674,11 +618,6 @@ def run_platform_build(
     build_llvm: Callable[[str, dict], None],
     build_library: Callable[[str, dict], None],
 ) -> int:
-    """Shared `llvm | lib | all [target ...]` command line.
-
-    llvm builds LLVM 14 for each target, lib builds the Rust library for each
-    target (LLVM must already be installed), and all does both in that order.
-    """
     argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("stage", choices=["llvm", "lib", "all"])
